@@ -3,15 +3,25 @@ name: RDP
 on:
   workflow_dispatch:
 
+permissions:
+  actions: write        # 允许通过 GITHUB_TOKEN 调用 Actions API 触发 workflow_dispatch
+  contents: read
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+
+    # 单次 job 的最大超时时间（分钟）——GitHub 最大支持 4320（72 小时）
+    timeout-minutes: 4320
+
+    env:
+      WORKFLOW_FILENAME: "rdp.yml"   # <- 如果你保存的 workflow 文件名不是 rdp.yml，请改成你实际的文件名
+      DISPATCH_BEFORE_MIN: 5         # 在 job 即将超时前多少分钟触发新的 workflow（默认为 5 分钟）
+      KEEPALIVE_INTERVAL_SEC: 300    # 每次循环睡眠时间，默认 300 秒（5 分钟）
 
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -19,25 +29,20 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -49,65 +54,83 @@ jobs:
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+
+          # 写入环境变量（供后续步骤使用）
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
+          $tsIP = $null; $retries = 0
+          while (-not $tsIP -and $retries -lt 20) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
               $retries++
           }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
+
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
+          if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP connection to RDP port 3389 failed"; exit 1 }
           Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection
+      - name: Keep Alive & Self-Dispatch Loop
         run: |
+          # 计算 job 的剩余时间（GitHub 没法直接告诉 runner 最大 timeout，这里用一个保守策略）
+          $interval = [int]$env:KEEPALIVE_INTERVAL_SEC
+          $dispatch_before_min = [int]$env:DISPATCH_BEFORE_MIN
+
+          # 运行时会持续打印连接信息，并在接近计划超时时调用 Actions API 自行触发下一次 workflow_dispatch
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASSWORD"
           Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
+
+          # 计算：我们将每次循环睡眠 interval 秒，并在触发次数达到阈值时做 self-dispatch。
+          # 例如：如果 interval=300（5min），dispatch_before_min=5，72小时超时场景，触发点在倒数5分钟左右。
+          # 简化策略：每 5 分钟打印一次状态；当到达大约 1 小时时（或你需要的逻辑），触发一次新 run。
+          # 为了兼容各种仓库超时设置，这里我们用循环直到显式取消（或 job 被终止）
+          $start = Get-Date
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+              Write-Host "$(Get-Date -Format o) - RDP Active - Tailscale IP: $env:TAILSCALE_IP"
+              Start-Sleep -Seconds $interval
+
+              # 当运行接近 70+ 小时或达到你希望时，触发一次 self-dispatch
+              # 我们通过触发 API 来创造新的 workflow run（请确保 WORKFLOW_FILENAME 与实际文件名一致）
+              # 为安全起见：只有在运行了至少 50 分钟后才允许触发（避免短时快速循环）
+              $elapsed = (Get-Date) - $start
+              if ($elapsed.TotalMinutes -ge 50 -and $elapsed.TotalMinutes % 300 -lt ($interval / 60)) {
+                  try {
+                      $repo = $env:GITHUB_REPOSITORY
+                      $file = $env:WORKFLOW_FILENAME
+                      $api = "https://api.github.com/repos/$repo/actions/workflows/$file/dispatches"
+                      $body = @{ ref = "${{ github.ref_name }}" } | ConvertTo-Json
+                      Write-Host "Attempting self-dispatch to $api"
+                      $hdr = @{
+                          Authorization = "Bearer $env:GITHUB_TOKEN"
+                          Accept = "application/vnd.github+json"
+                          "User-Agent" = "gh-actions-self-dispatch"
+                      }
+                      Invoke-RestMethod -Uri $api -Method Post -Headers $hdr -Body $body
+                      Write-Host "Self-dispatch triggered successfully."
+                      # 触发一次后休眠更长时间，避免重复触发
+                      Start-Sleep -Seconds 600
+                  } catch {
+                      Write-Warning "Self-dispatch failed: $_"
+                  }
+              }
           }
+
